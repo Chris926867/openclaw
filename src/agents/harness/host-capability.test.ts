@@ -4,6 +4,16 @@ import path from "node:path";
 import { Type } from "typebox";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../../test/helpers/promise.js";
+import {
+  readActiveTranscriptEntryAnchor,
+  replaceSessionEntrySync,
+} from "../../config/sessions/session-accessor.js";
+import {
+  resolveSqliteTranscriptScope,
+  runExclusiveSqliteSessionWrite,
+  toDatabaseOptions,
+} from "../../config/sessions/session-accessor.sqlite-scope.js";
+import { SQLITE_SESSION_WRITER_QUEUES } from "../../config/sessions/store-writer-state.js";
 import type { GatewayRequestContext } from "../../gateway/server-methods/types.js";
 import { onAgentEvent } from "../../infra/agent-events.js";
 import {
@@ -18,6 +28,8 @@ import {
   withPluginRuntimeGatewayRequestScope,
 } from "../../plugins/runtime/gateway-request-scope.js";
 import { AsyncWorkScope } from "../../shared/async-work-scope.js";
+import { openOpenClawAgentDatabase } from "../../state/openclaw-agent-db.js";
+import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import {
   closeAdmittedRunDelegatedAuthority,
   createOperationalRunInstanceRef,
@@ -30,12 +42,18 @@ import {
   rewrapToolWithBeforeToolCallHook,
   runBeforeToolCallHook,
 } from "../agent-tools.before-tool-call.js";
+import {
+  bindCodeModeTranscriptAuthority,
+  CodeModeTranscriptAuthority,
+} from "../code-mode-transcript-authority.js";
 import { createAgentRunRestartAbortError } from "../run-termination.js";
 import {
   attachInternalToolExecutionPreparer,
   getInternalToolExecutionPreparer,
   type InternalToolExecutionPreparer,
 } from "../runtime/internal-hooks.js";
+import { SessionManager } from "../sessions/session-manager.js";
+import { makeAgentAssistantMessage } from "../test-helpers/agent-message-fixtures.js";
 import type { AnyAgentTool } from "../tools/common.js";
 import { getGatewayToolCallerIdentity } from "../tools/gateway-caller-context.js";
 import { callGatewayTool } from "../tools/gateway.js";
@@ -54,6 +72,7 @@ const mockRewrap = vi.mocked(rewrapToolWithBeforeToolCallHook);
 const mockRunBefore = vi.mocked(runBeforeToolCallHook);
 const mockCallGatewayTool = vi.mocked(callGatewayTool);
 type HostAttempt = Parameters<typeof createAgentHarnessHostCapabilities>[0]["attempt"];
+const PROVIDER_TRANSCRIPT_COMMIT = Symbol.for("openclaw.agentHarness.providerTranscriptCommit.v1");
 
 type HostRevocationContext = {
   host: ReturnType<typeof createAgentHarnessHostCapabilities>;
@@ -156,6 +175,247 @@ afterEach(() => {
 });
 
 describe("agent harness host capability", () => {
+  it("rejects a provider transcript commit before its retained host owner can reach SQLite", async () => {
+    const { attempt } = await admittedAttempt("run-provider-assertion");
+    const authority = new CodeModeTranscriptAuthority({
+      expectedWriterRunId: "writer",
+      sessionId: "session-1",
+      sessionKey: "agent:main:session-1",
+      storePath: "/not-reached/sessions.json",
+    });
+    const commitPrefix = vi.spyOn(authority, "commitPrefix");
+    bindCodeModeTranscriptAuthority(attempt, authority);
+    const host = createAgentHarnessHostCapabilities({ attempt, pluginId: "codex" });
+    const commit = Reflect.get(host.capabilities, PROVIDER_TRANSCRIPT_COMMIT) as
+      | ((params: { assertCurrent: () => void; entries: [] }) => Promise<unknown>)
+      | undefined;
+    expect(commit).toEqual(expect.any(Function));
+
+    await expect(
+      commit?.({
+        assertCurrent: () => {
+          throw new Error("provider checkpoint replaced");
+        },
+        entries: [],
+      }),
+    ).rejects.toThrow("provider checkpoint replaced");
+    expect(commitPrefix).not.toHaveBeenCalled();
+    host.close();
+  });
+
+  it.each(policyRevocations)(
+    "rejects a retained provider transcript commit before SQLite after $name",
+    async ({ revoke }) => {
+      const { attempt, admission } = await admittedAttempt("run-provider-retained");
+      const authority = new CodeModeTranscriptAuthority({
+        expectedWriterRunId: "writer",
+        sessionId: "session-1",
+        sessionKey: "agent:main:session-1",
+        storePath: "/not-reached/sessions.json",
+      });
+      const commitPrefix = vi.spyOn(authority, "commitPrefix");
+      bindCodeModeTranscriptAuthority(attempt, authority);
+      const host = createAgentHarnessHostCapabilities({ attempt, pluginId: "codex" });
+      const commit = Reflect.get(host.capabilities, PROVIDER_TRANSCRIPT_COMMIT) as
+        | ((params: { assertCurrent: () => void; entries: [] }) => Promise<unknown>)
+        | undefined;
+      if (!commit) {
+        throw new Error("host did not bind its private transcript commit");
+      }
+      try {
+        await revoke({ host, attempt, admission });
+        await expect(commit({ assertCurrent: () => undefined, entries: [] })).rejects.toThrow();
+        expect(commitPrefix).not.toHaveBeenCalled();
+      } finally {
+        host.close();
+      }
+    },
+  );
+
+  it.each([
+    { mode: "allowed", error: undefined },
+    { mode: "host closed", error: "code mode transcript authority is closed" },
+    { mode: "authority released", error: "agent harness host capability is no longer active" },
+    { mode: "owner replaced", error: "agent harness host capability is no longer active" },
+  ] as const)(
+    "settles a queued provider transcript commit only with current host authority ($mode)",
+    async ({ mode, error }) => {
+      await withOpenClawTestState({ label: "host-provider-commit" }, async (state) => {
+        const runId = "run-provider-queued";
+        const scope = {
+          agentId: "main",
+          env: state.env,
+          expectedLifecycleRevision: "provider-lifecycle",
+          expectedWriterRunId: runId,
+          sessionId: "provider-session",
+          sessionKey: "agent:main:provider-session",
+          storePath: path.join(state.sessionsDir(), "sessions.json"),
+        };
+        replaceSessionEntrySync(scope, {
+          activeWriterRunId: scope.expectedWriterRunId,
+          lifecycleRevision: scope.expectedLifecycleRevision,
+          sessionId: scope.sessionId,
+          updatedAt: 1,
+        });
+        const manager = SessionManager.open(scope, state.workspaceDir);
+        const assistantId = manager.appendMessage(
+          makeAgentAssistantMessage({
+            content: [{ type: "toolCall", id: "provider-call", name: "read", arguments: {} }],
+            stopReason: "toolUse",
+          }),
+        );
+        const baseAnchor = readActiveTranscriptEntryAnchor({ ...scope, entryId: assistantId });
+        if (!baseAnchor) {
+          throw new Error("assistant lacks its authoritative transcript anchor");
+        }
+        const resolved = resolveSqliteTranscriptScope(scope);
+        const database = openOpenClawAgentDatabase(toDatabaseOptions(resolved));
+        const readState = () => ({
+          events: database.db
+            .prepare("SELECT * FROM transcript_events WHERE session_id = ? ORDER BY seq")
+            .all(scope.sessionId),
+          identities: database.db
+            .prepare("SELECT * FROM transcript_event_identities WHERE session_id = ? ORDER BY seq")
+            .all(scope.sessionId),
+          index: database.db
+            .prepare("SELECT * FROM session_transcript_index_state WHERE session_id = ?")
+            .get(scope.sessionId),
+          node: database.db
+            .prepare("SELECT * FROM session_nodes WHERE session_key = ?")
+            .get(scope.sessionKey),
+          cursors: { leaf: manager.getLeafId(), parent: manager.getAppendParentId() },
+        });
+        const before = readState();
+        const { attempt, admission } = await admittedAttempt(runId, {
+          sessionId: scope.sessionId,
+          sessionKey: scope.sessionKey,
+          cwd: state.workspaceDir,
+          workspaceDir: state.workspaceDir,
+        });
+        const authority = new CodeModeTranscriptAuthority(scope);
+        bindCodeModeTranscriptAuthority(attempt, authority);
+        const host = createAgentHarnessHostCapabilities({ attempt, pluginId: "copilot" });
+        type CommitParams = Parameters<CodeModeTranscriptAuthority["commitPrefix"]>[0] & {
+          assertCurrent: () => void;
+        };
+        const commit = Reflect.get(host.capabilities, PROVIDER_TRANSCRIPT_COMMIT) as
+          | ((params: CommitParams) => ReturnType<CodeModeTranscriptAuthority["commitPrefix"]>)
+          | undefined;
+        const entered = createDeferred();
+        const release = createDeferred();
+        let blocker: Promise<void> | undefined;
+        let pending: ReturnType<NonNullable<typeof commit>> | undefined;
+        let replacement: PreparedAgentRunAdmission | undefined;
+        try {
+          if (!commit) {
+            throw new Error("host did not bind its private transcript commit");
+          }
+          blocker = runExclusiveSqliteSessionWrite(resolved, async () => {
+            entered.resolve();
+            await release.promise;
+          });
+          await entered.promise;
+          pending = commit({
+            assertCurrent: () => {
+              if (manager.getAppendParentId() !== assistantId) {
+                throw new Error("provider checkpoint replaced");
+              }
+            },
+            baseAnchor,
+            entries: [
+              {
+                eventId: "provider-result",
+                identity: "copilot:provider-result",
+                message: {
+                  role: "toolResult",
+                  toolCallId: "provider-call",
+                  toolName: "read",
+                  content: [{ type: "text", text: "read result" }],
+                  isError: false,
+                  timestamp: 1,
+                },
+              },
+            ],
+          });
+          // Observe actual queue admission before revocation; otherwise an entry
+          // guard failure could masquerade as the final SQLite authority fence.
+          expect(SQLITE_SESSION_WRITER_QUEUES.get(database.path)?.pending).toHaveLength(1);
+          expect(readState()).toEqual(before);
+          if (mode === "host closed") {
+            host.close();
+          } else if (mode === "authority released") {
+            expect(closeAdmittedRunDelegatedAuthority(attempt.admittedRunContext)).toBe(true);
+          } else if (mode === "owner replaced") {
+            replacement = (await admittedAttempt(runId)).admission;
+          }
+          // Releasing or replacing admission must not change the SQLite writer
+          // or lifecycle: the queued commit must fail on host authority itself.
+          expect(readState()).toEqual(before);
+          release.resolve();
+          await blocker;
+          if (error) {
+            await expect(pending).rejects.toEqual(new Error(error));
+            expect(readState()).toEqual(before);
+            expect(
+              readActiveTranscriptEntryAnchor({ ...scope, entryId: "provider-result" }),
+            ).toBeUndefined();
+          } else {
+            const result = await pending;
+            if (result.kind !== "committed") {
+              throw new Error(`provider transcript was not committed: ${result.kind}`);
+            }
+            expect(result).toMatchObject({
+              kind: "committed",
+              results: [
+                {
+                  identity: "copilot:provider-result",
+                  anchor: {
+                    ...baseAnchor,
+                    entryId: "provider-result",
+                    effectiveParentId: assistantId,
+                    rawSeq: baseAnchor.rawSeq + 1,
+                    activeMessagePosition: baseAnchor.activeMessagePosition + 1,
+                    idempotencyKey: "copilot:provider-result",
+                  },
+                  message: {
+                    role: "toolResult",
+                    toolCallId: "provider-call",
+                    toolName: "read",
+                    content: [{ type: "text", text: "read result" }],
+                  },
+                },
+              ],
+            });
+            const after = readState();
+            expect(after.events).toHaveLength(before.events.length + 1);
+            expect(after.events.slice(0, -1)).toEqual(before.events);
+            expect(after.identities).toHaveLength(before.identities.length + 1);
+            expect(after.identities.slice(0, -1)).toEqual(before.identities);
+            expect(after.cursors).toEqual(before.cursors);
+            expect(result.results).toHaveLength(1);
+            expect(result.results[0]?.anchor).toEqual(
+              readActiveTranscriptEntryAnchor({ ...scope, entryId: "provider-result" }),
+            );
+          }
+          manager.reloadPersistedTranscript();
+          expect(manager.getLeafId()).toBe(error ? assistantId : "provider-result");
+          expect(manager.getAppendParentId()).toBe(error ? assistantId : "provider-result");
+        } finally {
+          release.resolve();
+          try {
+            await Promise.allSettled([blocker, pending]);
+            await SQLITE_SESSION_WRITER_QUEUES.get(database.path)?.drainPromise;
+            expect(SQLITE_SESSION_WRITER_QUEUES.has(database.path)).toBe(false);
+          } finally {
+            host.close();
+            replacement?.close();
+            admission.close();
+          }
+        }
+      });
+    },
+  );
+
   it.each(["restart", "unrelated scope", "user abort", "timeout"] as const)(
     "preserves the original cancellation when a startup capability closes: %s",
     async (reason) => {
