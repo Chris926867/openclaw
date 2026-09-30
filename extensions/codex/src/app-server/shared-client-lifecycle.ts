@@ -21,7 +21,7 @@ export type SharedCodexAppServerClientEntry = {
 };
 
 /** Keep warm clients reusable briefly, but never retain an unleased process forever. */
-export const CODEX_APP_SERVER_IDLE_RETIREMENT_MS = 5 * 60_000;
+const CODEX_APP_SERVER_IDLE_RETIREMENT_MS = 5 * 60_000;
 
 function cancelIdleRetirement(entry: SharedCodexAppServerClientEntry): void {
   if (entry.idleRetirementTimer) {
