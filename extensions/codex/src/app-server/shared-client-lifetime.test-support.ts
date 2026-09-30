@@ -11,7 +11,6 @@ import type { CodexAppServerStartOptions } from "./config.js";
 import { codexNativeSubagentMonitorRuntime } from "./native-subagent-monitor.js";
 import { registerSharedClientAuthRefreshTests } from "./shared-client-auth-refresh.test-support.js";
 import {
-  CODEX_APP_SERVER_IDLE_RETIREMENT_MS,
   getCurrentSharedClientEntry,
   waitForCodexAppServerClientExit,
 } from "./shared-client-lifecycle.js";
@@ -33,6 +32,8 @@ import {
   retainCodexAppServerBindingSubscription,
 } from "./thread-ownership.js";
 import { CODEX_APP_SERVER_VERSION } from "./version.js";
+
+const CODEX_APP_SERVER_IDLE_RETIREMENT_MS = 5 * 60_000;
 
 /** Register under the shared-client suite so its auth mocks and cleanup remain authoritative. */
 export function registerSharedClientLifetimeTests(
